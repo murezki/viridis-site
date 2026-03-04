@@ -1,0 +1,18 @@
+{
+  "kazakhstan": {
+    "map": "kazakhstan-map.png",
+    "mapAlt": "Map of Kazakhstan",
+    "columns": [
+      { "city": "Almaty",    "schools": ["NIS Ph&M", "AIS", "KIS", "Haileybury", "Fiztekh"] },
+      { "city": "Astana",    "schools": ["NIS IB", "ISSA"] },
+      { "city": "Karaganda", "schools": ["3 Lyceum"] }
+    ]
+  },
+  "uk": {
+    "map": "uk-map.png",
+    "mapAlt": "Map of the United Kingdom",
+    "columns": [
+      { "city": "Crowthorne", "schools": ["Wellington College"] }
+    ]
+  }
+}
