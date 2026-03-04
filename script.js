@@ -6,6 +6,8 @@
  *   data/album.json     — photo album slides
  *   data/founders.json  — co-founders info
  *   data/network.json   — network map countries
+ *
+ * data loads lazily — network on start, journal/community on first visit
  */
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -41,36 +43,81 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const isMobile = () => window.innerWidth <= 768;
 
-  // ─── data containers (loaded from JSON) ───
+
+  // ─── data containers (loaded lazily from JSON) ───
 
   let journalIssue = { label: '', articles: [] };
   let albumSlides  = [];
   let founders     = [];
   let countryData  = {};
 
-  // ─── load all external data ───
+  // track what's already loaded so we fetch each file only once
+  let networkLoaded   = false;
+  let journalLoaded   = false;
+  let communityLoaded = false;
 
-  async function loadData() {
+  // store promises so concurrent calls don't duplicate fetches
+  let journalPromise   = null;
+  let communityPromise = null;
+
+
+  // ─── lazy loaders ───
+
+  // network data loads on page start (small file, needed for slide 3)
+  async function loadNetworkData() {
+    if (networkLoaded) return;
     try {
-      const [articlesRes, albumRes, foundersRes, networkRes] = await Promise.all([
-        fetch('data/articles.json'),
-        fetch('data/album.json'),
-        fetch('data/founders.json'),
-        fetch('data/network.json')
-      ]);
-      journalIssue = await articlesRes.json();
-      albumSlides  = await albumRes.json();
-      founders     = await foundersRes.json();
-      countryData  = await networkRes.json();
+      const res = await fetch('data/network.json');
+      countryData = await res.json();
+      networkLoaded = true;
     } catch (err) {
-      console.warn('Data load error:', err);
+      console.warn('network data load error:', err);
     }
-    buildArticleList();
-    buildAlbum();
-    buildFounders();
   }
 
-  loadData();
+  // journal data loads on first visit to journal slide
+  function loadJournalData() {
+    if (journalLoaded) return Promise.resolve();
+    if (journalPromise) return journalPromise;
+    journalPromise = (async () => {
+      try {
+        const res = await fetch('data/articles.json');
+        journalIssue = await res.json();
+        journalLoaded = true;
+      } catch (err) {
+        console.warn('journal data load error:', err);
+      }
+      buildArticleList();
+      journalPromise = null;
+    })();
+    return journalPromise;
+  }
+
+  // community data loads on first visit to community slide
+  function loadCommunityData() {
+    if (communityLoaded) return Promise.resolve();
+    if (communityPromise) return communityPromise;
+    communityPromise = (async () => {
+      try {
+        const [albumRes, foundersRes] = await Promise.all([
+          fetch('data/album.json'),
+          fetch('data/founders.json')
+        ]);
+        albumSlides = await albumRes.json();
+        founders    = await foundersRes.json();
+        communityLoaded = true;
+      } catch (err) {
+        console.warn('community data load error:', err);
+      }
+      buildAlbum();
+      buildFounders();
+      communityPromise = null;
+    })();
+    return communityPromise;
+  }
+
+  // kick off the only thing we need at start
+  loadNetworkData();
 
 
   // ─── mobile burger menu ───
@@ -113,7 +160,19 @@ window.addEventListener('DOMContentLoaded', () => {
         if (action === 'home') {
           if (journalMode) startReturnTransition();
           else if (communityMode) startReturnFromCommunity();
-          else snapTo(0);
+          else {
+            const sy = window.scrollY || window.pageYOffset;
+            if (sy > 5) {
+              isSnapping = true;
+              clearTimeout(snapTimer);
+              gsap.to(window, {
+                scrollTo: { y: 0, autoKill: false },
+                duration: 0.75, ease: 'power2.inOut',
+                onUpdate()   { updateVisuals(window.scrollY || window.pageYOffset); },
+                onComplete() { isSnapping = false; updateVisuals(0); }
+              });
+            }
+          }
           return;
         }
         if (action === 'journal') {
@@ -473,6 +532,8 @@ window.addEventListener('DOMContentLoaded', () => {
   const H_WHITE = [255, 255, 255];
 
   let slide2Animated = false;
+  let snapTimer      = null;
+  let isSnapping     = false;
 
 
   // ─── visual update ───
@@ -512,169 +573,35 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 
 
-  // ─────────────────────────────────────────────────────
-  // snap system
-  //
-  // the old approach used the scroll event both to update
-  // visuals and to detect idle / cancel snaps. problem is
-  // gsap scrollTo fires scroll events too, so the handler
-  // fought the animation causing jitter.
-  //
-  // new design:
-  //   - a rAF loop continuously syncs visuals with scrollY
-  //   - real user input (wheel, touch, keys) is tracked
-  //     separately to reset an idle timer
-  //   - after 500ms of no real input we snap to nearest
-  //   - the snap tween uses autoKill:false so it ignores
-  //     scroll events entirely
-  //   - new real input during a snap kills it immediately
-  // ─────────────────────────────────────────────────────
+  // ─── snap ───
 
-  let snapTween   = null;
-  let idleTimer   = null;
-  let lastFrameY  = -1;
-
-  function cancelSnap() {
-    if (snapTween) { snapTween.kill(); snapTween = null; }
-  }
-
-  function resetIdleTimer() {
-    clearTimeout(idleTimer);
-    if (journalMode || communityMode) return;
-    idleTimer = setTimeout(performSnap, 500);
-  }
-
-  function performSnap() {
+  function doSnap() {
     if (journalMode || communityMode) return;
     const sy = window.scrollY || window.pageYOffset;
     const vh = window.innerHeight;
     const targets = [0, vh, 2 * vh];
     const dists   = targets.map(t => Math.abs(sy - t));
-    const nearest = targets[dists.indexOf(Math.min(...dists))];
-    if (Math.abs(sy - nearest) < 2) return;
-    cancelSnap();
-    snapTween = gsap.to(window, {
-      scrollTo: { y: nearest, autoKill: false },
-      duration: 0.75, ease: 'power3.inOut',
-      onComplete() { snapTween = null; }
+    const target  = targets[dists.indexOf(Math.min(...dists))];
+    isSnapping = true;
+    gsap.to(window, {
+      scrollTo: { y: target, autoKill: true }, duration: 0.8, ease: 'power2.inOut',
+      onUpdate()   { updateVisuals(window.scrollY || window.pageYOffset); },
+      onComplete() { isSnapping = false; updateVisuals(target); }
     });
   }
 
-  // helper used by nav handlers to scroll to a target then fire a callback
-  function snapTo(target, onDone) {
-    cancelSnap(); clearTimeout(idleTimer);
-    const sy = window.scrollY || window.pageYOffset;
-    if (Math.abs(sy - target) < 2) {
-      updateVisuals(target);
-      if (onDone) onDone();
-      return;
-    }
-    snapTween = gsap.to(window, {
-      scrollTo: { y: target, autoKill: false },
-      duration: 0.75, ease: 'power2.inOut',
-      onComplete() { snapTween = null; updateVisuals(target); if (onDone) onDone(); }
-    });
-  }
-
-  // rAF loop — the only thing that reads scrollY and calls updateVisuals
-  function tick() {
-    const sy = window.scrollY || window.pageYOffset;
-    if (sy !== lastFrameY) {
-      lastFrameY = sy;
-      if (!journalMode && !communityMode) updateVisuals(sy);
-    }
-    requestAnimationFrame(tick);
-  }
-  requestAnimationFrame(tick);
-
-  // real user input listeners
-  function onUserInput() {
+  function onScroll() {
     if (journalMode || communityMode) return;
-    cancelSnap();
-    resetIdleTimer();
+    updateVisuals(window.scrollY || window.pageYOffset);
+    if (isSnapping) return;
+    clearTimeout(snapTimer);
+    snapTimer = setTimeout(doSnap, 1000);
   }
 
-  window.addEventListener('wheel', onUserInput, { passive: true });
-  window.addEventListener('touchmove', onUserInput, { passive: true });
-
-  window.addEventListener('touchstart', () => {
-    if (journalMode || communityMode) return;
-    cancelSnap();
-    clearTimeout(idleTimer);
-  }, { passive: true });
-
-  window.addEventListener('touchend', () => {
-    if (journalMode || communityMode) return;
-    resetIdleTimer();
-  }, { passive: true });
-
-  window.addEventListener('keydown', (e) => {
-    if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(e.key)) onUserInput();
-  }, { passive: true });
-
-
-  // ─── header sync on resize ───
-
-  let lastWasMobile = isMobile();
-
-  function syncHeaderState() {
-    const mobile = isMobile();
-    if (mobile) viridisTitle.style.fontSize = '';
-
-    if (introTL.isActive()) { lastWasMobile = mobile; return; }
-
-    if (journalMode) {
-      viridisTitle.textContent = 'JOURNAL';
-      navCommunity.textContent = 'VIRIDIS';
-      navJournal.textContent   = 'JOURNAL';
-      if (!mobile) {
-        viridisTitle.style.fontSize = getBigSize() + 'px';
-        gsap.set(viridisTitle, { y: '0%' });
-        gsap.set(navCommunity, { y: '0%', opacity: 1 });
-        gsap.set(navJournal,   { y: '130%', opacity: 0 });
-        gsap.set([lineEdgeLeft, lineLongLeft],   { scaleX: 0 });
-        gsap.set([lineLongRight, lineEdgeRight], { scaleX: 1 });
-      }
-      const dc = rgbStr(H_DARK);
-      viridisTitle.style.color = dc; navItems.forEach(n => n.style.color = dc);
-      [lineLongLeft, lineLongRight, lineEdgeLeft, lineEdgeRight].forEach(el => el.style.background = dc);
-      cornerBtnLeft.style.color = dc; burgerBtn.style.color = dc;
-      bg.style.backgroundColor = rgbStr(C1);
-
-    } else if (communityMode) {
-      viridisTitle.textContent = 'COMMUNITY';
-      navJournal.textContent   = 'VIRIDIS';
-      navCommunity.textContent = 'COMMUNITY';
-      if (!mobile) {
-        viridisTitle.style.fontSize = getBigSize() + 'px';
-        gsap.set(viridisTitle, { y: '0%' });
-        gsap.set(navJournal,   { y: '0%', opacity: 1 });
-        gsap.set(navCommunity, { y: '130%', opacity: 0 });
-        gsap.set([lineEdgeLeft, lineLongLeft],   { scaleX: 1 });
-        gsap.set([lineLongRight, lineEdgeRight], { scaleX: 0 });
-      }
-      const dc = rgbStr(H_DARK);
-      viridisTitle.style.color = dc; navItems.forEach(n => n.style.color = dc);
-      [lineLongLeft, lineLongRight, lineEdgeLeft, lineEdgeRight].forEach(el => el.style.background = dc);
-      cornerBtnLeft.style.color = dc; burgerBtn.style.color = dc;
-      bg.style.backgroundColor = rgbStr(C1);
-
-    } else {
-      viridisTitle.textContent = 'VIRIDIS';
-      navJournal.textContent   = 'JOURNAL';
-      navCommunity.textContent = 'COMMUNITY';
-      gsap.set(viridisTitle, { y: '0%' });
-      gsap.set(navJournal,   { y: '0%', opacity: 1 });
-      gsap.set(navCommunity, { y: '0%', opacity: 1 });
-      gsap.set([lineLongLeft, lineLongRight],   { scaleX: 1 });
-      gsap.set([lineEdgeLeft, lineEdgeRight],   { scaleX: 1 });
-      updateVisuals(window.scrollY || window.pageYOffset);
-    }
-
-    lastWasMobile = mobile;
-  }
-
-  window.addEventListener('resize', syncHeaderState);
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', () => {
+    if (!journalMode && !communityMode) updateVisuals(window.scrollY || window.pageYOffset);
+  });
   updateVisuals(window.scrollY || window.pageYOffset);
 
 
@@ -731,32 +658,45 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 
 
-  // ─── journal transition ───
+  // ─── journal transition (slide 1 → slide 4) ───
 
   function startJournalTransition() {
     journalMode = true; lockScroll(); closeArticle();
-    cancelSnap(); clearTimeout(idleTimer);
+
+    // start fetching data in parallel with exit animation
+    const dataReady = loadJournalData();
+
     const darkColor = rgbStr(H_DARK);
     viridisTitle.style.color = darkColor; navItems.forEach(n => n.style.color = darkColor);
     [lineLongLeft, lineLongRight, lineEdgeLeft, lineEdgeRight].forEach(el => el.style.background = darkColor);
     cornerBtnLeft.style.color = darkColor; burgerBtn.style.color = darkColor;
     if (!isMobile()) viridisTitle.style.fontSize = getBigSize() + 'px';
 
-    const tl = gsap.timeline({ defaults: { ease: 'power2.in' } });
+    // exit animation
+    const tl = gsap.timeline({
+      defaults: { ease: 'power2.in' },
+      onComplete: () => enterJournal(dataReady)
+    });
     tl.to(lineEdgeLeft,  { scaleX: 0, transformOrigin: 'right center', duration: 0.45 });
     tl.to(lineLongLeft,  { scaleX: 0, transformOrigin: 'right center', duration: 0.45 }, '<');
     tl.to(navJournal,    { y: '130%', opacity: 0, duration: 0.45 }, '<');
     tl.to(viridisTitle,  { y: '115%', duration: 0.45 }, '<');
     tl.to(navCommunity,  { y: '130%', opacity: 0, duration: 0.45 }, '<');
     tl.to(contentRow,    { opacity: 0, y: -20, duration: 0.45 }, '<');
-    tl.call(() => {
-      viridisTitle.textContent = 'JOURNAL'; navCommunity.textContent = 'VIRIDIS'; navCommunity.classList.add('nav-clickable');
-      gsap.set([mainStage, slide2El, slide3El], { opacity: 0 });
-      gsap.set(slide4El, { opacity: 1, pointerEvents: 'auto' }); gsap.set(contentRow, { y: 0 });
-      bg.style.backgroundColor = rgbStr(C1);
-    });
-    tl.to(viridisTitle, { y: '0%', duration: 0.55, ease: 'power3.out' }, '+=0.12');
-    tl.to(navCommunity, { y: '0%', opacity: 1, duration: 0.38, ease: 'power3.out' }, '-=0.22');
+  }
+
+  // runs after exit animation completes, waits for data if needed
+  async function enterJournal(dataReady) {
+    await dataReady;
+
+    viridisTitle.textContent = 'JOURNAL'; navCommunity.textContent = 'VIRIDIS'; navCommunity.classList.add('nav-clickable');
+    gsap.set([mainStage, slide2El, slide3El], { opacity: 0 });
+    gsap.set(slide4El, { opacity: 1, pointerEvents: 'auto' }); gsap.set(contentRow, { y: 0 });
+    bg.style.backgroundColor = rgbStr(C1);
+
+    const tl = gsap.timeline({ defaults: { ease: 'power3.out' } });
+    tl.to(viridisTitle, { y: '0%', duration: 0.55 }, '+=0.12');
+    tl.to(navCommunity, { y: '0%', opacity: 1, duration: 0.38 }, '-=0.22');
     fadeInJournalContent(tl);
   }
 
@@ -767,7 +707,7 @@ window.addEventListener('DOMContentLoaded', () => {
     tl.to(viridisTitle, { y: '115%', duration: 0.45 }, '-=0.15');
     tl.to(navCommunity, { y: '130%', opacity: 0, duration: 0.45 }, '<');
     tl.call(() => {
-      viridisTitle.textContent = 'VIRIDIS'; navJournal.textContent = 'JOURNAL'; navCommunity.textContent = 'COMMUNITY'; navCommunity.classList.remove('nav-clickable');
+      viridisTitle.textContent = 'VIRIDIS'; navCommunity.textContent = 'COMMUNITY'; navCommunity.classList.remove('nav-clickable');
       if (!isMobile()) viridisTitle.style.fontSize = getBigSize() + 'px';
       gsap.set(mainStage, { opacity: 1, clearProps: 'transform' });
       gsap.set(slide2El, { opacity: 1, transform: 'translateX(0vw) translateY(100vh)' });
@@ -789,32 +729,43 @@ window.addEventListener('DOMContentLoaded', () => {
   }
 
 
-  // ─── community transition ───
+  // ─── community transition (slide 1 → slide 5) ───
 
   function startCommunityTransition() {
     communityMode = true; lockScroll();
-    cancelSnap(); clearTimeout(idleTimer);
+
+    // start fetching data in parallel with exit animation
+    const dataReady = loadCommunityData();
+
     const darkColor = rgbStr(H_DARK);
     viridisTitle.style.color = darkColor; navItems.forEach(n => n.style.color = darkColor);
     [lineLongLeft, lineLongRight, lineEdgeLeft, lineEdgeRight].forEach(el => el.style.background = darkColor);
     cornerBtnLeft.style.color = darkColor; burgerBtn.style.color = darkColor;
     if (!isMobile()) viridisTitle.style.fontSize = getBigSize() + 'px';
 
-    const tl = gsap.timeline({ defaults: { ease: 'power2.in' } });
+    const tl = gsap.timeline({
+      defaults: { ease: 'power2.in' },
+      onComplete: () => enterCommunity(dataReady)
+    });
     tl.to(lineLongRight, { scaleX: 0, transformOrigin: 'left center', duration: 0.45 });
     tl.to(lineEdgeRight, { scaleX: 0, transformOrigin: 'left center', duration: 0.45 }, '<');
     tl.to(navJournal,    { y: '130%', opacity: 0, duration: 0.45 }, '<');
     tl.to(viridisTitle,  { y: '115%', duration: 0.45 }, '<');
     tl.to(navCommunity,  { y: '130%', opacity: 0, duration: 0.45 }, '<');
     tl.to(contentRow,    { opacity: 0, y: -20, duration: 0.45 }, '<');
-    tl.call(() => {
-      viridisTitle.textContent = 'COMMUNITY'; navJournal.textContent = 'VIRIDIS';
-      gsap.set([mainStage, slide2El, slide3El], { opacity: 0 });
-      gsap.set(slide5El, { opacity: 1, pointerEvents: 'auto' }); gsap.set(contentRow, { y: 0 });
-      bg.style.backgroundColor = rgbStr(C1);
-    });
-    tl.to(viridisTitle, { y: '0%', duration: 0.55, ease: 'power3.out' }, '+=0.12');
-    tl.to(navJournal,   { y: '0%', opacity: 1, duration: 0.38, ease: 'power3.out' }, '-=0.22');
+  }
+
+  async function enterCommunity(dataReady) {
+    await dataReady;
+
+    viridisTitle.textContent = 'COMMUNITY'; navJournal.textContent = 'VIRIDIS';
+    gsap.set([mainStage, slide2El, slide3El], { opacity: 0 });
+    gsap.set(slide5El, { opacity: 1, pointerEvents: 'auto' }); gsap.set(contentRow, { y: 0 });
+    bg.style.backgroundColor = rgbStr(C1);
+
+    const tl = gsap.timeline({ defaults: { ease: 'power3.out' } });
+    tl.to(viridisTitle, { y: '0%', duration: 0.55 }, '+=0.12');
+    tl.to(navJournal,   { y: '0%', opacity: 1, duration: 0.38 }, '-=0.22');
     fadeInCommunityContent(tl);
   }
 
@@ -824,7 +775,7 @@ window.addEventListener('DOMContentLoaded', () => {
     tl.to(viridisTitle, { y: '115%', duration: 0.45 }, '-=0.15');
     tl.to(navJournal,   { y: '130%', opacity: 0, duration: 0.45 }, '<');
     tl.call(() => {
-      viridisTitle.textContent = 'VIRIDIS'; navJournal.textContent = 'JOURNAL'; navCommunity.textContent = 'COMMUNITY';
+      viridisTitle.textContent = 'VIRIDIS'; navJournal.textContent = 'JOURNAL';
       if (!isMobile()) viridisTitle.style.fontSize = getBigSize() + 'px';
       gsap.set(mainStage, { opacity: 1, clearProps: 'transform' });
       gsap.set(slide2El, { opacity: 1, transform: 'translateX(0vw) translateY(100vh)' });
@@ -849,8 +800,14 @@ window.addEventListener('DOMContentLoaded', () => {
   // ─── direct transition journal ↔ community ───
 
   function startDirectTransition(targetSlide) {
+    // preload destination data in parallel with exit animation
+    const dataReady = targetSlide === 'journal' ? loadJournalData() : loadCommunityData();
+
     const fromJournal = journalMode;
-    const tl = gsap.timeline({ defaults: { ease: 'power2.in' } });
+    const tl = gsap.timeline({
+      defaults: { ease: 'power2.in' },
+      onComplete: () => enterDirect(targetSlide, fromJournal, dataReady)
+    });
     tl.to(viridisTitle, { y: '115%', duration: 0.4 });
     if (fromJournal) {
       tl.to(navCommunity, { y: '130%', opacity: 0, duration: 0.4 }, '<');
@@ -859,47 +816,38 @@ window.addEventListener('DOMContentLoaded', () => {
       tl.to(navJournal, { y: '130%', opacity: 0, duration: 0.4 }, '<');
       fadeOutCommunityContent(tl);
     }
-    tl.call(() => {
-      if (fromJournal) {
-        gsap.set(slide4El, { opacity: 0, pointerEvents: 'none' });
-        gsap.set([slide4El.querySelector('.journal-left'), slide4El.querySelector('.journal-divider'), slide4El.querySelector('.journal-right')], { clearProps: 'opacity,y,scaleY' });
-        journalMode = false; closeArticle();
-      } else {
-        gsap.set(slide5El, { opacity: 0, pointerEvents: 'none' });
-        gsap.set([slide5El.querySelector('.community-top'), slide5El.querySelector('.community-bottom')], { clearProps: 'opacity,y' });
-        communityMode = false;
-      }
-      bg.style.backgroundColor = rgbStr(C1);
-      const dc = rgbStr(H_DARK); viridisTitle.style.color = dc; cornerBtnLeft.style.color = dc; burgerBtn.style.color = dc;
-      navItems.forEach(n => n.style.color = dc);
-      [lineLongLeft, lineLongRight, lineEdgeLeft, lineEdgeRight].forEach(el => el.style.background = dc);
+  }
 
-      if (targetSlide === 'journal') {
-        journalMode = true;
-        viridisTitle.textContent = 'JOURNAL';
-        navJournal.textContent   = 'JOURNAL';
-        navCommunity.textContent = 'VIRIDIS';
-        navCommunity.classList.add('nav-clickable');
-        gsap.set(slide4El, { opacity: 1, pointerEvents: 'auto' });
-        gsap.set([lineEdgeLeft, lineLongLeft],   { scaleX: 0 });
-        gsap.set([lineLongRight, lineEdgeRight], { scaleX: 1 });
-      } else {
-        communityMode = true;
-        viridisTitle.textContent = 'COMMUNITY';
-        navJournal.textContent   = 'VIRIDIS';
-        navCommunity.textContent = 'COMMUNITY';
-        navCommunity.classList.remove('nav-clickable');
-        gsap.set(slide5El, { opacity: 1, pointerEvents: 'auto' });
-        gsap.set([lineEdgeLeft, lineLongLeft],   { scaleX: 1 });
-        gsap.set([lineLongRight, lineEdgeRight], { scaleX: 0 });
-      }
-    });
-    tl.to(viridisTitle, { y: '0%', duration: 0.55, ease: 'power3.out' }, '+=0.1');
+  async function enterDirect(targetSlide, fromJournal, dataReady) {
+    await dataReady;
+
+    if (fromJournal) {
+      gsap.set(slide4El, { opacity: 0, pointerEvents: 'none' });
+      gsap.set([slide4El.querySelector('.journal-left'), slide4El.querySelector('.journal-divider'), slide4El.querySelector('.journal-right')], { clearProps: 'opacity,y,scaleY' });
+      journalMode = false; closeArticle();
+    } else {
+      gsap.set(slide5El, { opacity: 0, pointerEvents: 'none' });
+      gsap.set([slide5El.querySelector('.community-top'), slide5El.querySelector('.community-bottom')], { clearProps: 'opacity,y' });
+      communityMode = false;
+    }
+    bg.style.backgroundColor = rgbStr(C1);
+    const dc = rgbStr(H_DARK); viridisTitle.style.color = dc; cornerBtnLeft.style.color = dc; burgerBtn.style.color = dc;
+
     if (targetSlide === 'journal') {
-      tl.to(navCommunity, { y: '0%', opacity: 1, duration: 0.38, ease: 'power3.out' }, '-=0.22');
+      journalMode = true; viridisTitle.textContent = 'JOURNAL'; navCommunity.textContent = 'VIRIDIS'; navCommunity.classList.add('nav-clickable');
+      gsap.set(slide4El, { opacity: 1, pointerEvents: 'auto' });
+    } else {
+      communityMode = true; viridisTitle.textContent = 'COMMUNITY'; navJournal.textContent = 'VIRIDIS'; navCommunity.classList.remove('nav-clickable');
+      gsap.set(slide5El, { opacity: 1, pointerEvents: 'auto' });
+    }
+
+    const tl = gsap.timeline({ defaults: { ease: 'power3.out' } });
+    tl.to(viridisTitle, { y: '0%', duration: 0.55 }, '+=0.1');
+    if (targetSlide === 'journal') {
+      tl.to(navCommunity, { y: '0%', opacity: 1, duration: 0.38 }, '-=0.22');
       fadeInJournalContent(tl);
     } else {
-      tl.to(navJournal, { y: '0%', opacity: 1, duration: 0.38, ease: 'power3.out' }, '-=0.22');
+      tl.to(navJournal, { y: '0%', opacity: 1, duration: 0.38 }, '-=0.22');
       fadeInCommunityContent(tl);
     }
   }
@@ -910,19 +858,31 @@ window.addEventListener('DOMContentLoaded', () => {
   navJournal.addEventListener('click', () => {
     if (communityMode) { startReturnFromCommunity(); return; }
     if (journalMode || introTL.isActive()) return;
-    cancelSnap(); clearTimeout(idleTimer);
     const sy = window.scrollY || window.pageYOffset;
     if (sy < 5) { startJournalTransition(); }
-    else { snapTo(0, () => gsap.delayedCall(0.18, startJournalTransition)); }
+    else {
+      isSnapping = true; clearTimeout(snapTimer);
+      gsap.to(window, {
+        scrollTo: { y: 0, autoKill: false }, duration: 0.75, ease: 'power2.inOut',
+        onUpdate() { updateVisuals(window.scrollY || window.pageYOffset); },
+        onComplete() { isSnapping = false; updateVisuals(0); gsap.delayedCall(0.18, startJournalTransition); }
+      });
+    }
   });
 
   navCommunity.addEventListener('click', () => {
     if (journalMode) { startReturnTransition(); return; }
     if (communityMode || introTL.isActive()) return;
-    cancelSnap(); clearTimeout(idleTimer);
     const sy = window.scrollY || window.pageYOffset;
     if (sy < 5) { startCommunityTransition(); }
-    else { snapTo(0, () => gsap.delayedCall(0.18, startCommunityTransition)); }
+    else {
+      isSnapping = true; clearTimeout(snapTimer);
+      gsap.to(window, {
+        scrollTo: { y: 0, autoKill: false }, duration: 0.75, ease: 'power2.inOut',
+        onUpdate() { updateVisuals(window.scrollY || window.pageYOffset); },
+        onComplete() { isSnapping = false; updateVisuals(0); gsap.delayedCall(0.18, startCommunityTransition); }
+      });
+    }
   });
 
 });
